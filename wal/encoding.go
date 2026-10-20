@@ -1,101 +1,67 @@
 package wal
 
 import (
-	"encoding/binary"
 	"fmt"
 
+	"github.com/kunwar-dev/quorumkv/internal/codec"
 	"github.com/kunwar-dev/quorumkv/raft"
 )
 
-// encoder builds compact binary payloads using uvarints.
-type encoder struct{ buf []byte }
-
-func (e *encoder) byte(b byte)      { e.buf = append(e.buf, b) }
-func (e *encoder) uvarint(v uint64) { e.buf = binary.AppendUvarint(e.buf, v) }
-func (e *encoder) bytes(b []byte) {
-	e.uvarint(uint64(len(b)))
-	e.buf = append(e.buf, b...)
+func encodeHardState(hs raft.HardState) []byte {
+	var e codec.Encoder
+	e.Byte(byte(recHardState))
+	e.Uvarint(hs.Term)
+	e.String(hs.VotedFor)
+	return e.Buf
 }
 
-func (e *encoder) entries(es []raft.Entry) {
-	e.uvarint(uint64(len(es)))
+func encodeEntries(es []raft.Entry) []byte {
+	var e codec.Encoder
+	e.Byte(byte(recEntries))
+	e.Uvarint(uint64(len(es)))
 	for _, en := range es {
-		e.uvarint(en.Index)
-		e.uvarint(en.Term)
-		e.byte(byte(en.Type))
-		e.bytes(en.Data)
+		e.Uvarint(en.Index)
+		e.Uvarint(en.Term)
+		e.Byte(byte(en.Type))
+		e.Bytes(en.Data)
 	}
+	return e.Buf
 }
 
-// decoder reads payloads written by encoder. The first error sticks.
-type decoder struct {
-	buf []byte
-	err error
+func encodeTruncate(index uint64) []byte {
+	var e codec.Encoder
+	e.Byte(byte(recTruncate))
+	e.Uvarint(index)
+	return e.Buf
 }
 
-func (d *decoder) fail(what string) {
-	if d.err == nil {
-		d.err = fmt.Errorf("%w: truncated %s", ErrCorrupt, what)
-	}
+func decodeHardState(d *codec.Decoder) (raft.HardState, error) {
+	hs := raft.HardState{Term: d.Uvarint(), VotedFor: d.String()}
+	return hs, wrap(d.Err())
 }
 
-func (d *decoder) uvarint() uint64 {
-	if d.err != nil {
-		return 0
-	}
-	v, n := binary.Uvarint(d.buf)
-	if n <= 0 {
-		d.fail("uvarint")
-		return 0
-	}
-	d.buf = d.buf[n:]
-	return v
-}
-
-func (d *decoder) byte() byte {
-	if d.err != nil {
-		return 0
-	}
-	if len(d.buf) == 0 {
-		d.fail("byte")
-		return 0
-	}
-	b := d.buf[0]
-	d.buf = d.buf[1:]
-	return b
-}
-
-func (d *decoder) bytes() []byte {
-	n := d.uvarint()
-	if d.err != nil {
-		return nil
-	}
-	if uint64(len(d.buf)) < n {
-		d.fail("bytes")
-		return nil
-	}
-	b := append([]byte(nil), d.buf[:n]...)
-	d.buf = d.buf[n:]
-	return b
-}
-
-func (d *decoder) entries() []raft.Entry {
-	n := d.uvarint()
-	if d.err != nil || n > uint64(len(d.buf)) { // each entry needs at least 1 byte
-		d.fail("entries")
-		return nil
+func decodeEntries(d *codec.Decoder) ([]raft.Entry, error) {
+	n := d.Uvarint()
+	// Each entry occupies at least four bytes, which bounds the allocation
+	// even if a corrupt record claims an enormous count.
+	if d.Err() != nil || n > uint64(d.Len()) {
+		return nil, fmt.Errorf("%w: bad entry count", ErrCorrupt)
 	}
 	es := make([]raft.Entry, 0, n)
 	for range n {
-		e := raft.Entry{Index: d.uvarint(), Term: d.uvarint(), Type: raft.EntryType(d.byte())}
-		e.Data = d.bytes()
-		if d.err != nil {
-			return nil
-		}
-		if len(e.Data) == 0 {
-			e.Data = nil
+		e := raft.Entry{Index: d.Uvarint(), Term: d.Uvarint(), Type: raft.EntryType(d.Byte())}
+		e.Data = d.Bytes()
+		if d.Err() != nil {
+			return nil, wrap(d.Err())
 		}
 		es = append(es, e)
 	}
-	return es
+	return es, nil
+}
+
+func wrap(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", ErrCorrupt, err)
 }

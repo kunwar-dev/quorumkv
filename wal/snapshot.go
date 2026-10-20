@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/kunwar-dev/quorumkv/internal/codec"
 	"github.com/kunwar-dev/quorumkv/raft"
 )
 
@@ -18,17 +19,17 @@ var snapMagic = []byte("QKVSNAP1")
 //
 //	magic(8) | crc32c(4) of the rest | uvarint index | uvarint term | data
 func writeSnapshot(dir string, snap raft.Snapshot, durable bool) error {
-	var body encoder
-	body.uvarint(snap.Meta.Index)
-	body.uvarint(snap.Meta.Term)
-	body.buf = append(body.buf, snap.Data...)
+	var body codec.Encoder
+	body.Uvarint(snap.Meta.Index)
+	body.Uvarint(snap.Meta.Term)
+	body.Buf = append(body.Buf, snap.Data...)
 
 	var buf bytes.Buffer
 	buf.Write(snapMagic)
 	var sum [4]byte
-	binary.LittleEndian.PutUint32(sum[:], crc32.Checksum(body.buf, crcTable))
+	binary.LittleEndian.PutUint32(sum[:], crc32.Checksum(body.Buf, crcTable))
 	buf.Write(sum[:])
-	buf.Write(body.buf)
+	buf.Write(body.Buf)
 
 	tmpPath := filepath.Join(dir, snapshotFile+".tmp")
 	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
@@ -76,10 +77,10 @@ func readSnapshot(path string) (*raft.Snapshot, error) {
 	if crc32.Checksum(body, crcTable) != sum {
 		return nil, fmt.Errorf("%w: snapshot checksum mismatch in %s", ErrCorrupt, path)
 	}
-	d := decoder{buf: body}
-	meta := raft.SnapshotMeta{Index: d.uvarint(), Term: d.uvarint()}
-	if d.err != nil {
-		return nil, d.err
+	d := codec.NewDecoder(body)
+	meta := raft.SnapshotMeta{Index: d.Uvarint(), Term: d.Uvarint()}
+	if err := wrap(d.Err()); err != nil {
+		return nil, err
 	}
-	return &raft.Snapshot{Meta: meta, Data: append([]byte(nil), d.buf...)}, nil
+	return &raft.Snapshot{Meta: meta, Data: append([]byte(nil), d.Remaining()...)}, nil
 }

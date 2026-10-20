@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/kunwar-dev/quorumkv/internal/codec"
 	"github.com/kunwar-dev/quorumkv/raft"
 )
 
@@ -161,25 +162,25 @@ func (s *Storage) scan(f *os.File) (valid int64, records int, err error) {
 }
 
 func (s *Storage) applyRecord(p []byte) error {
-	d := decoder{buf: p[1:]}
+	d := codec.NewDecoder(p[1:])
 	switch recordType(p[0]) {
 	case recHardState:
-		hs := raft.HardState{Term: d.uvarint(), VotedFor: string(d.bytes())}
-		if d.err != nil {
-			return d.err
+		hs, err := decodeHardState(d)
+		if err != nil {
+			return err
 		}
 		s.hs = hs
 		return s.state.SetHardState(hs)
 	case recEntries:
-		entries := d.entries()
-		if d.err != nil {
-			return d.err
+		entries, err := decodeEntries(d)
+		if err != nil {
+			return err
 		}
 		return s.state.Append(entries)
 	case recTruncate:
-		idx := d.uvarint()
-		if d.err != nil {
-			return d.err
+		idx := d.Uvarint()
+		if err := wrap(d.Err()); err != nil {
+			return err
 		}
 		return s.state.TruncateFrom(idx)
 	default:
@@ -196,11 +197,7 @@ func (s *Storage) InitialState() (raft.HardState, *raft.Snapshot, []raft.Entry, 
 func (s *Storage) SetHardState(hs raft.HardState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var e encoder
-	e.byte(byte(recHardState))
-	e.uvarint(hs.Term)
-	e.bytes([]byte(hs.VotedFor))
-	if err := s.writeRecord(e.buf); err != nil {
+	if err := s.writeRecord(encodeHardState(hs)); err != nil {
 		return err
 	}
 	s.hs = hs
@@ -214,10 +211,7 @@ func (s *Storage) Append(entries []raft.Entry) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var e encoder
-	e.byte(byte(recEntries))
-	e.entries(entries)
-	if err := s.writeRecord(e.buf); err != nil {
+	if err := s.writeRecord(encodeEntries(entries)); err != nil {
 		return err
 	}
 	return s.state.Append(entries)
@@ -227,10 +221,7 @@ func (s *Storage) Append(entries []raft.Entry) error {
 func (s *Storage) TruncateFrom(index uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var e encoder
-	e.byte(byte(recTruncate))
-	e.uvarint(index)
-	if err := s.writeRecord(e.buf); err != nil {
+	if err := s.writeRecord(encodeTruncate(index)); err != nil {
 		return err
 	}
 	return s.state.TruncateFrom(index)
@@ -262,16 +253,9 @@ func (s *Storage) compactLocked() error {
 		return fmt.Errorf("wal: compact: %w", err)
 	}
 	w := bufio.NewWriter(tmp)
-	var e encoder
-	e.byte(byte(recHardState))
-	e.uvarint(s.hs.Term)
-	e.bytes([]byte(s.hs.VotedFor))
-	writeFramed(w, e.buf)
+	writeFramed(w, encodeHardState(s.hs))
 	if len(entries) > 0 {
-		e = encoder{}
-		e.byte(byte(recEntries))
-		e.entries(entries)
-		writeFramed(w, e.buf)
+		writeFramed(w, encodeEntries(entries))
 	}
 	if err := w.Flush(); err != nil {
 		tmp.Close()
