@@ -1,0 +1,43 @@
+# A 3-node quorumkv cluster plus Prometheus.
+#
+#   docker compose up -d --build
+#   alias qkv='docker compose exec n1 qkv -endpoints n1:7001,n2:7001,n3:7001'
+#   qkv put hello world && qkv get hello && qkv status
+#   docker compose stop n2        # kill a node; the cluster keeps serving
+#   open http://localhost:9090    # quorumkv_* metrics
+#
+# Followers redirect writes to the leader's in-network address (nX:7001),
+# so use qkv inside the network as above, or send requests to the leader.
+
+x-node: &node
+  build: .
+  image: quorumkv:local
+  restart: unless-stopped
+
+services:
+  n1:
+    <<: *node
+    command: ["-id", "n1", "-peers", "n1=n1:7001,n2=n2:7001,n3=n3:7001", "-listen", "0.0.0.0:7001", "-data-dir", "/data", "-log-format", "json"]
+    ports: ["7001:7001"]
+    volumes: ["n1-data:/data"]
+  n2:
+    <<: *node
+    command: ["-id", "n2", "-peers", "n1=n1:7001,n2=n2:7001,n3=n3:7001", "-listen", "0.0.0.0:7001", "-data-dir", "/data", "-log-format", "json"]
+    ports: ["7002:7001"]
+    volumes: ["n2-data:/data"]
+  n3:
+    <<: *node
+    command: ["-id", "n3", "-peers", "n1=n1:7001,n2=n2:7001,n3=n3:7001", "-listen", "0.0.0.0:7001", "-data-dir", "/data", "-log-format", "json"]
+    ports: ["7003:7001"]
+    volumes: ["n3-data:/data"]
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes: ["./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+    depends_on: [n1, n2, n3]
+
+volumes:
+  n1-data:
+  n2-data:
+  n3-data:

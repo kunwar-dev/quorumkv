@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: quorumkv
+    static_configs:
+      - targets: ["n1:7001", "n2:7001", "n3:7001"]

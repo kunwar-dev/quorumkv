@@ -1,0 +1,18 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - misspell
+    - bodyclose
+  settings:
+    staticcheck:
+      checks: ["SA*", "S1*"]
+
+formatters:
+  enable:
+    - gofmt

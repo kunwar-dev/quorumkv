@@ -136,7 +136,14 @@ type Node struct {
 	snapshot []byte
 
 	// Volatile state.
-	leaderID         string
+	leaderID string
+	// persistedIndex is the last log index known to be durable locally. The
+	// leader appends to its in-memory log and persists asynchronously, in
+	// batches, in parallel with replication (Raft paper §10.2.1).
+	persistedIndex   uint64
+	persistInflight  bool
+	persistCond      *sync.Cond
+	persistNotify    chan struct{}
 	commitIndex      uint64
 	lastApplied      uint64
 	pendingSnapshot  bool
@@ -168,18 +175,20 @@ func NewNode(cfg Config, applyCh chan<- ApplyMsg) (*Node, error) {
 	h := fnv.New64a()
 	h.Write([]byte(cfg.ID))
 	n := &Node{
-		cfg:       cfg,
-		id:        cfg.ID,
-		storage:   cfg.Storage,
-		transport: cfg.Transport,
-		logger:    cfg.Logger.With("node", cfg.ID),
-		applyCh:   applyCh,
-		rng:       rand.New(rand.NewSource(time.Now().UnixNano() ^ int64(h.Sum64()))),
-		term:      hs.Term,
-		votedFor:  hs.VotedFor,
-		stopCh:    make(chan struct{}),
+		cfg:           cfg,
+		id:            cfg.ID,
+		storage:       cfg.Storage,
+		transport:     cfg.Transport,
+		logger:        cfg.Logger.With("node", cfg.ID),
+		applyCh:       applyCh,
+		rng:           rand.New(rand.NewSource(time.Now().UnixNano() ^ int64(h.Sum64()))),
+		term:          hs.Term,
+		votedFor:      hs.VotedFor,
+		stopCh:        make(chan struct{}),
+		persistNotify: make(chan struct{}, 1),
 	}
 	n.applyCond = sync.NewCond(&n.mu)
+	n.persistCond = sync.NewCond(&n.mu)
 	for _, p := range cfg.Peers {
 		if p != cfg.ID {
 			n.peers = append(n.peers, p)
@@ -193,15 +202,17 @@ func NewNode(cfg Config, applyCh chan<- ApplyMsg) (*Node, error) {
 		n.pendingSnapshot = true
 	}
 	n.log.entries = entries
+	n.persistedIndex = n.log.lastIndex()
 	n.resetElectionTimerLocked()
 	return n, nil
 }
 
 // Start launches the node's background goroutines.
 func (n *Node) Start() {
-	n.wg.Add(2)
+	n.wg.Add(3)
 	go n.runTicker()
 	go n.runApplier()
+	go n.runPersister()
 }
 
 // Stop halts the node and waits for its goroutines to exit. It is idempotent.
@@ -218,6 +229,7 @@ func (n *Node) Stop() {
 		n.leaderStop = nil
 	}
 	n.applyCond.Broadcast()
+	n.persistCond.Broadcast()
 	n.mu.Unlock()
 	n.wg.Wait()
 }
@@ -263,9 +275,7 @@ func (n *Node) Propose(data []byte) (index, term uint64, err error) {
 		return 0, 0, ErrNotLeader
 	}
 	e := Entry{Index: n.log.lastIndex() + 1, Term: n.term, Type: EntryNormal, Data: data}
-	n.appendLocalLocked(e)
-	n.notifyReplicatorsLocked()
-	n.maybeCommitLocked()
+	n.appendLeaderLocked(e)
 	return e.Index, e.Term, nil
 }
 
@@ -274,6 +284,7 @@ func (n *Node) Propose(data []byte) (index, term uint64, err error) {
 func (n *Node) Snapshot(index uint64, data []byte) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	n.flushLocked()
 	if index <= n.log.snapIndex {
 		return nil
 	}
@@ -284,6 +295,7 @@ func (n *Node) Snapshot(index uint64, data []byte) error {
 	n.log.compact(index, t)
 	n.snapshot = data
 	n.must(n.storage.SaveSnapshot(Snapshot{Meta: SnapshotMeta{Index: index, Term: t}, Data: data}))
+	n.persistedIndex = max(n.persistedIndex, index)
 	n.logger.Debug("log compacted", "index", index, "term", t)
 	return nil
 }
@@ -393,7 +405,8 @@ func (n *Node) becomeLeaderLocked() {
 	next := n.log.lastIndex() + 1
 	// A no-op in the new term lets entries from earlier terms commit (§5.4.2)
 	// and gives the leader an up-to-date commit index quickly.
-	n.appendLocalLocked(Entry{Index: next, Term: n.term, Type: EntryNoop})
+	noop := Entry{Index: next, Term: n.term, Type: EntryNoop}
+	n.log.append(noop)
 
 	for _, peer := range n.peers {
 		n.nextIndex[peer] = next
@@ -404,7 +417,8 @@ func (n *Node) becomeLeaderLocked() {
 		go n.runReplicator(peer, n.term, notify, n.leaderStop)
 	}
 	n.logger.Info("became leader", "term", n.term, "lastIndex", n.log.lastIndex())
-	n.maybeCommitLocked()
+	n.notifyPersisterLocked()
+	n.notifyReplicatorsLocked()
 }
 
 // HandleRequestVote implements Handler.
@@ -576,7 +590,7 @@ func (n *Node) maybeCommitLocked() {
 		return
 	}
 	matches := make([]uint64, 0, len(n.peers)+1)
-	matches = append(matches, n.log.lastIndex())
+	matches = append(matches, n.persistedIndex) // the leader counts itself only once durable
 	for _, p := range n.peers {
 		matches = append(matches, n.matchIndex[p])
 	}
@@ -600,6 +614,7 @@ func (n *Node) maybeCommitLocked() {
 func (n *Node) HandleAppendEntries(req *AppendEntriesRequest) *AppendEntriesResponse {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	n.flushLocked()
 	if req.Term < n.term {
 		return &AppendEntriesResponse{Term: n.term}
 	}
@@ -655,6 +670,7 @@ func (n *Node) HandleAppendEntries(req *AppendEntriesRequest) *AppendEntriesResp
 func (n *Node) HandleInstallSnapshot(req *InstallSnapshotRequest) *InstallSnapshotResponse {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	n.flushLocked()
 	if req.Term < n.term {
 		return &InstallSnapshotResponse{Term: n.term}
 	}
@@ -679,6 +695,7 @@ func (n *Node) HandleInstallSnapshot(req *InstallSnapshotRequest) *InstallSnapsh
 		n.must(n.storage.TruncateFrom(req.LastIncludedIndex + 1))
 	}
 	n.snapshot = req.Data
+	n.persistedIndex = n.log.lastIndex()
 	n.commitIndex = req.LastIncludedIndex
 	n.pendingSnapshot = true
 	n.applyCond.Broadcast()
@@ -748,9 +765,86 @@ func (n *Node) deliver(msg ApplyMsg) bool {
 // ---------------------------------------------------------------------------
 // Persistence helpers
 
+// appendLocalLocked appends and synchronously persists entries. Followers
+// use it because they must not acknowledge entries until they are durable.
+// Callers must have waited for any in-flight leader batch (waitPersistLocked)
+// so storage writes stay ordered.
 func (n *Node) appendLocalLocked(entries ...Entry) {
 	n.log.append(entries...)
 	n.must(n.storage.Append(entries))
+	n.persistedIndex = n.log.lastIndex()
+}
+
+// appendLeaderLocked appends to the in-memory log and lets replication start
+// immediately; the persister makes the entry durable in the background,
+// batching concurrent proposals into one storage write (group commit).
+func (n *Node) appendLeaderLocked(e Entry) {
+	n.log.append(e)
+	n.notifyPersisterLocked()
+	n.notifyReplicatorsLocked()
+}
+
+func (n *Node) notifyPersisterLocked() {
+	select {
+	case n.persistNotify <- struct{}{}:
+	default:
+	}
+}
+
+// waitPersistLocked blocks until no leader batch is being written, so that
+// truncations and snapshots are ordered after it in storage.
+func (n *Node) waitPersistLocked() {
+	for n.persistInflight && !n.stopped {
+		n.persistCond.Wait()
+	}
+}
+
+// flushLocked makes the whole in-memory log durable before the caller acts
+// on it. A deposed leader may still hold entries the persister has not
+// written; a follower must never acknowledge entries that are not on disk,
+// and storage truncations must be ordered after earlier appends.
+func (n *Node) flushLocked() {
+	n.waitPersistLocked()
+	if n.stopped || n.persistedIndex >= n.log.lastIndex() {
+		return
+	}
+	lo := max(n.persistedIndex, n.log.snapIndex) + 1
+	n.must(n.storage.Append(n.log.slice(lo, n.log.lastIndex()+1)))
+	n.persistedIndex = n.log.lastIndex()
+}
+
+// runPersister writes the leader's not-yet-durable entries in batches.
+func (n *Node) runPersister() {
+	defer n.wg.Done()
+	for {
+		select {
+		case <-n.stopCh:
+			return
+		case <-n.persistNotify:
+		}
+		n.mu.Lock()
+		for !n.stopped && n.persistedIndex < n.log.lastIndex() {
+			lo := max(n.persistedIndex, n.log.snapIndex) + 1
+			hi := n.log.lastIndex()
+			batch := n.log.slice(lo, hi+1)
+			n.persistInflight = true
+			n.mu.Unlock()
+
+			err := n.storage.Append(batch)
+
+			n.mu.Lock()
+			n.persistInflight = false
+			n.persistCond.Broadcast()
+			n.must(err)
+			// While the write was in flight the log could only grow or be
+			// compacted, never truncated, so [lo, hi] is now durable.
+			if t, ok := n.log.term(hi); (!ok && hi <= n.log.snapIndex) || t == batch[len(batch)-1].Term {
+				n.persistedIndex = max(n.persistedIndex, hi)
+			}
+			n.maybeCommitLocked()
+		}
+		n.mu.Unlock()
+	}
 }
 
 func (n *Node) persistHardStateLocked() {
