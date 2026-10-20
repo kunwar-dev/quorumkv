@@ -196,6 +196,18 @@ func TestFollowerRedirectsToLeader(t *testing.T) {
 			break
 		}
 	}
+	// A follower only learns the leader from its first heartbeat after an
+	// election; until then it correctly answers 503.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if st, err := h.status(h.peers[follower]); err == nil && st.Leader == leader {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("follower never learned the leader")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	hc := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	req, _ := http.NewRequest(http.MethodPut, "http://"+h.peers[follower]+"/v1/kv/k", strings.NewReader("v"))
 	resp, err := hc.Do(req)
